@@ -65,7 +65,14 @@ def send(subject, body):
                           context=ssl.create_default_context(), timeout=30) as s:
         s.login(user, pw)
         s.send_message(msg)
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
     print("SENT -> %s | %s" % (to, subject))
+    # 写进仓库里的回执，便于事后核对（工作流会把它提交上去）
+    try:
+        with open("sent.log", "a", encoding="utf-8") as f:
+            f.write("%s  已发送 [cloud] -> %s | %s\n" % (stamp, to, subject))
+    except OSError:
+        pass
 
 
 def main():
