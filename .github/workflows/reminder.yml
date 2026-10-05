@@ -1,0 +1,47 @@
+name: DSH 邮件提醒
+
+# GitHub 的 cron 用 UTC。*/5 = 每 5 分钟一次。
+# 注意：高峰期 GitHub 可能延迟几分钟才真正启动，脚本里有 7 分钟容忍窗口。
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # 允许在网页上手动点一下立刻跑
+
+# 保持仓库"有活动"，否则 GitHub 会在 60 天无活动后自动停掉定时工作流
+permissions:
+  contents: write
+
+concurrency:
+  group: dsh-reminder
+  cancel-in-progress: false
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 检查并发送到点的提醒
+        env:
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          QQ_AUTH_CODE: ${{ secrets.QQ_AUTH_CODE }}
+          REMINDERS_JSON: ${{ secrets.REMINDERS_JSON }}
+        run: python send_due.py
+
+      - name: 每周打一次卡，防止定时工作流被自动停用
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date -u +%u%H)" = "12" ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ heartbeat" > heartbeat.txt
+            git config user.name  "dsh-reminder-bot"
+            git config user.email "dsh-reminder-bot@users.noreply.github.com"
+            git add heartbeat.txt
+            git diff --quiet --cached || git commit -m "heartbeat"
+            git push
+          fi
