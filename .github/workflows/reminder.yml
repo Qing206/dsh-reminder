@@ -1,11 +1,12 @@
 name: DSH 邮件提醒
 
-# GitHub 的 cron 用 UTC。*/5 = 每 5 分钟一次。
-# 高峰期 GitHub 可能延迟几分钟才真正启动，脚本里留了 7 分钟容忍窗口。
+# GitHub 的 cron 会被降频（实测把 */5 拖成了两三小时才跑一次），
+# 所以脚本不依赖"准时"，改成「过期未发就补发」，只在迟到上吃亏，不会漏。
 on:
   schedule:
     - cron: "*/5 * * * *"
-  workflow_dispatch: {}   # 允许在网页上手动点一下立刻跑
+    - cron: "17 * * * *"      # 每小时一次，用来写心跳、保持仓库活跃
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -25,7 +26,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 检查并发送到点的提醒
+      - name: 检查并补发到点的提醒
         env:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
@@ -33,19 +34,20 @@ jobs:
           REMINDERS_JSON: ${{ secrets.REMINDERS_JSON }}
         run: python send_due.py
 
-      # 把 sent.log 提交回仓库：既是发信回执，也顺带让仓库保持"有活动"，
+      # 提交 sent.json / sent.log / 心跳；顺带让仓库保持"有活动"，
       # 否则 GitHub 会在 60 天无活动后自动停掉定时工作流。
-      - name: 提交回执
+      - name: 提交回执与心跳
         if: always()
         run: |
           git config user.name  "dsh-reminder-bot"
           git config user.email "dsh-reminder-bot@users.noreply.github.com"
           [ -f sent.log ] || touch sent.log
-          if [ "$(date -u +%u%H)" = "12" ]; then date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt; else touch heartbeat.txt; fi
+          [ -f sent.json ] || echo "[]" > sent.json
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
           git add -A
           if ! git diff --quiet --cached; then
             git commit -m "log $(date -u +%Y-%m-%dT%H:%MZ)"
             git push
           else
-            echo "没有新的回执，跳过提交"
+            echo "无变化，跳过提交"
           fi
