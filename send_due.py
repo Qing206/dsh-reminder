@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-云端版：检查到点的提醒并发送。
-在 GitHub Actions 里跑，完全不依赖本地电脑。
+云端版：检查到点的提醒并发送。跑在 GitHub Actions 上，不依赖本地电脑。
 
-环境变量（都放在仓库 Secrets 里）：
-  MAIL_TO        收件人，如 2046466062@qq.com
-  MAIL_FROM      发件人，等于 QQ 邮箱地址
-  QQ_AUTH_CODE   QQ 邮箱 16 位授权码
-  REMINDERS_JSON 提醒清单（JSON 数组）
+环境变量（仓库 Secrets）：
+  MAIL_TO / MAIL_FROM / QQ_AUTH_CODE / REMINDERS_JSON
 
-清单里每条：
-  { "subject": "...", "body": "...", "due": "2026-10-06 07:30", "repeat": "none" }
-
-去重靠「时间窗口」：只发 due 落在 [now-WINDOW, now] 区间内的，
-所以不需要往仓库里写状态文件。
+关键设计 —— 「补发，不丢」：
+  GitHub 的 cron 会被降频，实际可能几小时才跑一次，所以不能用
+  「只看最近 N 分钟」的窗口判断。这里改成：
+    只要 due <= 现在、而且没发过 -> 就发。
+  已发记录存在仓库根目录的 sent.json 里（只存哈希，不含标题正文，
+  所以公开仓库也不会泄露内容）。一次都没跑成也不会丢，只会迟到。
 """
 import datetime as dt
+import hashlib
 import json
 import os
 import smtplib
@@ -25,28 +23,30 @@ import sys
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate
 
-WINDOW_MIN = int(os.environ.get("WINDOW_MIN", "7"))  # 容忍 cron 延迟
-TZ_OFFSET = int(os.environ.get("TZ_OFFSET_HOURS", "8"))  # Asia/Shanghai
+STATE = "sent.json"
+REPEAT_CATCHUP_HOURS = 24      # 重复型提醒最多补发最近 24 小时内错过的次数
+TZ_OFFSET = int(os.environ.get("TZ_OFFSET_HOURS", "8"))
 
 
 def now_local():
     return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) + dt.timedelta(hours=TZ_OFFSET)
 
 
-def fires_on(base, day, repeat):
-    """base 是提醒的首次时间；判断 day（同一天的日期）是否该触发。"""
-    if day < base.date():
-        return False
-    repeat = (repeat or "none").lower()
-    if repeat == "none":
-        return day == base.date()
-    if repeat == "daily":
-        return True
-    if repeat == "weekdays":
-        return day.weekday() < 5
-    if repeat == "weekly":
-        return day.weekday() == base.weekday()
-    return day == base.date()
+def key_of(subject, occ):
+    return hashlib.sha1(("%s|%s" % (subject, occ.strftime("%Y-%m-%d %H:%M"))).encode("utf-8")).hexdigest()[:16]
+
+
+def load_state():
+    if os.path.exists(STATE):
+        try:
+            return set(json.load(open(STATE, encoding="utf-8")))
+        except Exception:
+            pass
+    return set()
+
+
+def save_state(s):
+    json.dump(sorted(s), open(STATE, "w", encoding="utf-8"), indent=0)
 
 
 def send(subject, body):
@@ -65,14 +65,46 @@ def send(subject, body):
                           context=ssl.create_default_context(), timeout=30) as s:
         s.login(user, pw)
         s.send_message(msg)
+
     stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
     print("SENT -> %s | %s" % (to, subject))
-    # 写进仓库里的回执，便于事后核对（工作流会把它提交上去）
     try:
         with open("sent.log", "a", encoding="utf-8") as f:
             f.write("%s  已发送 [cloud] -> %s | %s\n" % (stamp, to, subject))
     except OSError:
         pass
+
+
+def fires_on(base, day, repeat):
+    if day < base.date():
+        return False
+    repeat = (repeat or "none").lower()
+    if repeat == "daily":
+        return True
+    if repeat == "weekdays":
+        return day.weekday() < 5
+    if repeat == "weekly":
+        return day.weekday() == base.weekday()
+    return day == base.date()
+
+
+def occurrences(base, repeat, now):
+    """列出这条提醒在 [base, now] 之间所有应该触发的时刻。"""
+    repeat = (repeat or "none").lower()
+    if repeat == "none":
+        return [base] if base <= now else []
+    out = []
+    day = base.date()
+    limit = (now - dt.timedelta(hours=REPEAT_CATCHUP_HOURS)).date()
+    if day < limit:
+        day = limit
+    while day <= now.date():
+        if fires_on(base, day, repeat):
+            occ = base.replace(year=day.year, month=day.month, day=day.day)
+            if base <= occ <= now:
+                out.append(occ)
+        day += dt.timedelta(days=1)
+    return out
 
 
 def main():
@@ -83,12 +115,11 @@ def main():
 
     items = json.loads(raw)
     now = now_local()
-    lo = now - dt.timedelta(minutes=WINDOW_MIN)
-    print("当前时间 %s，窗口 %s ~ %s，共 %d 条提醒"
-          % (now.strftime("%Y-%m-%d %H:%M"), lo.strftime("%H:%M"),
-             now.strftime("%H:%M"), len(items)))
+    state = load_state()
+    print("现在 %s（时区 +%d），共 %d 条提醒，已发记录 %d 条"
+          % (now.strftime("%Y-%m-%d %H:%M"), TZ_OFFSET, len(items), len(state)))
 
-    hit = 0
+    sent = 0
     for r in items:
         if not r.get("enabled", True):
             continue
@@ -97,29 +128,21 @@ def main():
         except Exception as e:
             print("跳过格式不对的提醒：%s (%s)" % (r.get("subject"), e))
             continue
-        # 把重复规则展开成"今天这一次"的绝对时间
-        cands = []
-        for day in {lo.date(), now.date()}:
-            if fires_on(base, day, r.get("repeat")):
-                cands.append(day)
-        if not cands:
-            continue
-        fired = False
-        for day in sorted(cands):
-            occ = base.replace(year=day.year, month=day.month, day=day.day)
-            if lo <= occ <= now:
-                fired = True
-        if not fired:
-            continue
-        try:
-            send(r["subject"], r["body"])
-            hit += 1
-        except Exception as e:
-            print("发送失败：%s -> %s" % (r.get("subject"), e))
-            return 1
+        for occ in occurrences(base, r.get("repeat"), now):
+            k = key_of(r["subject"], occ)
+            if k in state:
+                continue
+            try:
+                send(r["subject"], r["body"])
+            except Exception as e:
+                print("发送失败：%s -> %s" % (r.get("subject"), e))
+                save_state(state)
+                return 1
+            state.add(k)
+            save_state(state)
+            sent += 1
 
-    if hit == 0:
-        print("本窗口内没有到点的提醒")
+    print("本次共发出 %d 封" % sent)
     return 0
 
 
