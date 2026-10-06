@@ -24,7 +24,7 @@ from email.message import EmailMessage
 from email.utils import formataddr, formatdate
 
 STATE = "sent.json"
-REPEAT_CATCHUP_HOURS = 24      # 重复型提醒最多补发最近 24 小时内错过的次数
+REPEAT_CATCHUP_HOURS = 6       # 重复型提醒最多往回补 6 小时（避免刚建好就补发昨天那次）
 TZ_OFFSET = int(os.environ.get("TZ_OFFSET_HOURS", "8"))
 
 
@@ -89,7 +89,8 @@ def fires_on(base, day, repeat):
 
 
 def occurrences(base, repeat, now):
-    """列出这条提醒在 [base, now] 之间所有应该触发的时刻。"""
+    """列出这条提醒在 [base, now] 之间应该触发的时刻。
+    重复型只取最近一次，避免补发风暴。"""
     repeat = (repeat or "none").lower()
     if repeat == "none":
         return [base] if base <= now else []
@@ -104,7 +105,7 @@ def occurrences(base, repeat, now):
             if base <= occ <= now:
                 out.append(occ)
         day += dt.timedelta(days=1)
-    return out
+    return out[-1:]          # 只补最近一次
 
 
 def main():
